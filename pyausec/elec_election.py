@@ -7,6 +7,8 @@ logger = get_logger(__name__)
 
 
 class ElectionInfo:
+    """Class to handle the election information."""
+
     def __init__(self, grabber: ElectionGrabber) -> None:
         """Initialise the ElectionInfo object."""
         self.grabber = grabber
