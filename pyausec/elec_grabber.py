@@ -15,26 +15,27 @@ logger = get_logger(__name__)
 class AusElectionGrabber:
     """Grabs data from the AEC FTP server."""
 
-    def __init__(self, cache_dir: Path | None = None) -> None:
+    def __init__(self, cache_dir: Path | None = None, current_election: str | None = None) -> None:
         """Initialise the AusElectionGrabber.
 
         Args:
-            cache_dir (Path): Path to the instance directory.
+            cache_dir (Path): Path to the cache directory, where the zips will be stored.
+            current_election (str): The current election (number) to grab data for.
+                If None, will grab the only election.
         """
         if cache_dir is None:
             cache_dir = self._get_default_cache_dir()
-
         self.cache_dir = cache_dir
-        self.ftp_tree: dict[str, dict] = {}
-        self.grab()
-        elections = list(self.ftp_tree.keys())
-        if len(elections) != 1:
-            msg = "There should only be one election in the FTP tree, you haven't accounted for this"
-            raise ValueError(msg)
-        self.election_root = elections[0]
-        logger.info("Election root: %s", self.election_root)
+
+        self.ftp_listing: list[str] = []
+        self.refresh_ftp_file_list()
+
+        self.election_root = self.get_election(current_election)
+
+        self.tracked_files: dict[str, Path] = {}
 
         self.election_preload_file = None
+
         self.populate_election()
         self.populate_candidates()
         self.get_latest_results()
@@ -46,36 +47,74 @@ class AusElectionGrabber:
 
         return Path("~/.cache/pyausec").expanduser()
 
-    # region: Preload
-    def get_preload(self) -> None:
-        """Get the preload file from the FTP server."""
-        election_dict = self.ftp_tree[self.election_root]
-        preload_dir = election_dict["Detailed"]["Preload"]
-        file_list = list(preload_dir.keys())
-        if len(file_list) != 1:
-            msg = "There should only be one file in the candidates directory, you haven't accounted for this"
-            raise ValueError(msg)
+    def get_election(self, override: str | None) -> str:
+        """Get the current election number from the FTP listing."""
+        logger.debug("Getting election number from FTP listing.")
+        election_list_scratch = [file.split("/")[1] for file in self.ftp_listing]
+        election_list_scratch_set = set(election_list_scratch)
 
-        ftp_srv_src_dir = f"/{self.election_root}/Detailed/Preload"
-        self.download_file(file_dir=ftp_srv_src_dir, file_name=file_list[0])
-        self.election_preload = self.cache_dir / file_list[0]
+        if len(election_list_scratch_set) == 0:
+            msg = "No elections found in the FTP listing."
+            raise ValueError(msg)
+        if not override and len(election_list_scratch_set) > 1:
+            msg = "Multiple elections found in the FTP listing, please specify an override."
+            raise ValueError(msg)
+        if override:
+            if override not in election_list_scratch_set:
+                msg = f"Override election {override} not found in the FTP listing."
+                raise ValueError(msg)
+            logger.info("Override election found: %s", override)
+            return override
+
+        election: str = election_list_scratch_set.pop()
+        logger.info("Election found: %s", election)
+        return election
+
+    # region: Preload
+    def _get_latest_ftp_file_from_path(self, path: str, file_role: str, file_extension: str) -> Path:
+        """Get the latest file, from a folder in the FTP server."""
+        logger.debug("Getting latest %s file from path: %s for %s", file_extension, path, file_role)
+
+        file_shortlist = [file for file in self.ftp_listing if path in file and file.endswith(file_extension)]
+
+        if len(file_shortlist) == 0:
+            msg = f"No preload files found in {file_shortlist}."
+            raise ValueError(msg)
+        if len(file_shortlist) > 1 and file_role == "preload":
+            msg = f"Invalid number of preload files found: {len(file_shortlist)}, expected 1."
+            logger.warning(msg)
+
+        file_shortlist.sort()
+
+        preload_file_full_path = file_shortlist[-1]
+        preload_file: str = preload_file_full_path.split("/")[-1]
+
+        self.download_file(file_dir=path, file_name=preload_file, file_role=file_role)
+        return self.tracked_files[file_role]
+
+    def get_preload(self) -> Path:
+        """Get the preload file from the FTP server if needed."""
+        return self._get_latest_ftp_file_from_path(
+            path=f"/{self.election_root}/Detailed/Preload",
+            file_role="preload",
+            file_extension=".zip",
+        )
 
     def populate_election(self) -> None:
         """Populate election."""
-        if not self.election_preload_file:
-            self.get_preload()
+        preload_path = self.get_preload()
 
         election_info_content = self._get_file_as_str_from_zip(
-            self.election_preload, f"xml/eml-110-event-{self.election_root}.xml"
+            preload_path, f"xml/eml-110-event-{self.election_root}.xml"
         )
 
     def populate_candidates(self) -> None:
         """Populate candidates."""
-        if not self.election_preload_file:
-            self.get_preload()
+        preload_path = self.get_preload()
+        logger.debug("Populating candidates.")
 
         candidate_info_content = self._get_file_as_str_from_zip(
-            self.election_preload, f"xml/eml-230-candidates-{self.election_root}.xml"
+            preload_path, f"xml/eml-230-candidates-{self.election_root}.xml"
         )
 
     # endregion
@@ -83,38 +122,31 @@ class AusElectionGrabber:
     # region: Results
     def get_latest_results(self) -> None:
         """Get the latest results from the FTP server."""
-        election_dict = self.ftp_tree[self.election_root]
-        results_dir = election_dict["Standard"]["Light"]
-
-        results_file_list = list(results_dir.keys())
-        results_file_list.sort()
-        latest_file = results_file_list[-1]
-        logger.info("Latest results file: %s", latest_file)  # Thank you AEC for the naming convention
-
-        ftp_srv_src_dir = f"/{self.election_root}/Standard/Light"
-
-        self.download_file(file_dir=ftp_srv_src_dir, file_name=latest_file)
-
-        zip_file_path = self.cache_dir / latest_file
-        print(zip_file_path)
+        logger.debug("Getting latest results from FTP server.")
+        results_zip_path = self._get_latest_ftp_file_from_path(
+            path=f"/{self.election_root}/Standard/Light",
+            file_role="results",
+            file_extension=".zip",
+        )
 
         latest_results_content = self._get_file_as_str_from_zip(
-            zip_file_path,
+            results_zip_path,
             f"xml/aec-mediafeed-results-standard-light-{self.election_root}.xml",
         )
 
     # endregion
 
     # region: Helper methods
-    def _get_file_as_str_from_zip(self, zip_file_path: str, file_in_zip_path_str: str) -> str:
+    def _get_file_as_str_from_zip(self, zip_file_path: Path, file_in_zip_path_str: str) -> str:
         """Get a file as a string from a zip file."""
+        logger.debug("Getting file from zip: %s", file_in_zip_path_str)
         zip_file = ZipFile(zip_file_path, mode="r")
         with zip_file as zip_file:
             # List all files in the zip file
             logger.trace("Files in zip file: %s", zip_file.namelist())
             return zip_file.read(file_in_zip_path_str).decode("utf-8")
 
-    def download_file(self, file_dir: str, file_name: str) -> None:
+    def download_file(self, file_dir: str, file_name: str, file_role: str) -> None:
         """Download a file from the FTP server."""
         logger.info("Downloading file: %s from %s", file_name, file_dir)
 
@@ -123,60 +155,17 @@ class AusElectionGrabber:
 
         if output_file.exists():
             logger.info("File already exists, skipping download.")
-            return
+        else:
+            with contextlib.closing(FTP(FTP_URL)) as ftp:
+                ftp.login()
+                ftp.cwd(file_dir)
 
-        with contextlib.closing(FTP(FTP_URL)) as ftp:
-            ftp.login()
-            ftp.cwd(file_dir)
+                with output_file.open("wb") as local_file:
+                    ftp.retrbinary(f"RETR {file_name}", local_file.write)
 
-            with output_file.open("wb") as local_file:
-                ftp.retrbinary(f"RETR {file_name}", local_file.write)
+        self.tracked_files[file_role] = output_file
 
-    def grab(self) -> None:
-        """Grab the data from the AEC FTP server."""
-        files = self._get_ftp_file_list()
-        self.ftp_tree = self._create_ftp_tree_from_list(files)
-
-    def _create_ftp_tree_from_list(self, files: list[str]) -> dict[str, dict]:
-        """Create a tree from the list of files on the FTP server.
-
-        Args:
-            files (list[str]): List of file paths from the FTP server
-
-        Returns:
-            dict: A nested dictionary representing the directory structure
-        """
-        tree: dict[str, dict | None] = {}
-
-        for file_path in files:
-            # Skip empty paths
-            if not file_path:
-                continue
-
-            # Split path into components
-            parts = file_path.strip("/").split("/")
-
-            # Navigate the tree, creating branches as needed
-            current: dict[str, dict | None] = tree
-            for part in parts[:-1]:  # Process directories
-                if part not in current:
-                    current[part] = {}
-                current = current[part]
-
-            # Handle the leaf (file)s
-            leaf = parts[-1]
-            if "." in leaf:  # It's a file
-                current[leaf] = None  # Files are leaf nodes
-            elif leaf not in current:
-                current[leaf] = {}
-
-        if not tree:
-            msg = "No files found in the FTP directory."
-            raise ValueError(msg)
-
-        return tree
-
-    def _get_ftp_file_list(self) -> list[str]:
+    def refresh_ftp_file_list(self) -> None:
         """Recursively get the list of files on the FTP server.
 
         Returns:
@@ -210,6 +199,13 @@ class AusElectionGrabber:
 
                 return found
 
-            return _recurse_get_paths("")
+            paths = _recurse_get_paths("")
+            paths.sort()
+
+            if len(paths) == 0:
+                msg = "No files found on the FTP server."
+                raise ValueError(msg)
+
+            self.ftp_listing = paths
 
     # endregion
